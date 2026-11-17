@@ -1,0 +1,45 @@
+{
+  "name": "docker-playground",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    // Real Docker engine *inside* the dev container (works in Codespaces too).
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": true,
+      "dockerDashComposeVersion": "v2"
+    },
+    // JDK + Maven so you can also run the app without Docker.
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "25",
+      "jdkDistro": "tem",
+      "installMaven": true
+    },
+    // Node.js + npm for the Vue frontend.
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "24"
+    }
+  },
+  "forwardPorts": [8080, 8081, 5173],
+  "portsAttributes": {
+    "8080": { "label": "backend (Spring Boot / Swagger)", "onAutoForward": "notify" },
+    "8081": { "label": "frontend (nginx container)", "onAutoForward": "notify" },
+    "5173": { "label": "frontend (Vite dev server)", "onAutoForward": "notify" }
+  },
+  "postCreateCommand": "bash .devcontainer/post_create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-azuretools.vscode-containers",
+        "vscjava.vscode-java-pack",
+        "vmware.vscode-boot-dev-pack",
+        "humao.rest-client",
+        "Vue.volar"
+      ]
+    }
+  },
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "4gb",
+    "storage": "32gb"
+  }
+}

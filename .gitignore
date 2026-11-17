@@ -1,0 +1,16 @@
+# Maven
+target/
+
+# IDEs
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+
+# OS
+.DS_Store
+node_modules/
+dist/
+
+# Local environment (secrets)
+.env
