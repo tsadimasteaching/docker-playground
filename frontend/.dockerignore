@@ -1,8 +1,0 @@
-node_modules/
-dist/
-.vscode/
-.idea/
-.git/
-Dockerfile*
-.dockerignore
-README.md
