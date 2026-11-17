@@ -22,7 +22,7 @@
   "forwardPorts": [8080, 8081, 5173],
   "portsAttributes": {
     "8080": { "label": "backend (Spring Boot / Swagger)", "onAutoForward": "notify" },
-    "8081": { "label": "frontend (nginx container)", "onAutoForward": "notify" },
+    "8081": { "label": "frontend (container)", "onAutoForward": "notify" },
     "5173": { "label": "frontend (Vite dev server)", "onAutoForward": "notify" }
   },
   "postCreateCommand": "bash .devcontainer/post_create.sh",

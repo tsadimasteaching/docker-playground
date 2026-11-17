@@ -16,9 +16,6 @@ alias dc='docker compose'
 alias c=clear
 ALIASES
 
-# Create .env for docker compose from the template (only if it does not exist yet).
-[ -f .env ] || cp .env.example .env
-
 # Pre-fetch Maven dependencies so the first `mvn spring-boot:run` is fast.
 if [ -f backend/pom.xml ]; then
   (cd backend && mvn -B -q dependency:go-offline) || echo "Maven pre-fetch failed (not fatal)."
@@ -29,4 +26,4 @@ if [ -f frontend/package.json ]; then
   (cd frontend && npm ci) || echo "npm ci failed (not fatal)."
 fi
 
-echo "Dev container ready. Try: docker version && cd backend && docker build -t tickets:naive ."
+echo "Dev container ready. Try: docker version && docker run --rm hello-world"

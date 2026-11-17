@@ -35,7 +35,7 @@ On first start, when the database is empty, [DataSeeder](src/main/java/gr/hua/di
 | DELETE | `/api/tickets/{id}`          | USER        | delete own `OPEN` ticket                      |
 | POST   | `/api/tickets/{id}/assign`   | AGENT       | assign to me → `IN_PROGRESS`                  |
 | POST   | `/api/tickets/{id}/resolve`  | AGENT       | `{resolution}` → `RESOLVED`                   |
-| GET    | `/actuator/health`           | public      | health check (used by Docker `HEALTHCHECK`)   |
+| GET    | `/actuator/health`           | public      | health check (for Docker `HEALTHCHECK`)     |
 
 **Swagger UI:** <http://localhost:8080/swagger-ui.html>. Click **Authorize** and enter a user. The OpenAPI JSON is at `/v3/api-docs`.
 
@@ -69,7 +69,7 @@ spring.datasource.password=${DB_PASSWORD:tickets}
 
 `${DB_HOST:localhost}` means "the environment variable `DB_HOST`, or `localhost` if it is not set". With the defaults, `mvn spring-boot:run` works against a local Postgres container without any setup.
 
-| Variable      | Default     | Set to, in Docker                                       |
+| Variable      | Default     | Set to, in a container                                  |
 |---------------|-------------|---------------------------------------------------------|
 | `DB_HOST`     | `localhost` | name of the Postgres container/service (`tickets-db`, `db`) |
 | `DB_PORT`     | `5432`      |                                                         |
@@ -96,24 +96,16 @@ Precedence, highest first: command-line args (`--server.port=9090`) → environm
 # locally (Linux/macOS shell)
 DB_PASSWORD=secret SPRING_JPA_SHOW_SQL=true mvn spring-boot:run
 
-# docker run: one by one, or from a file
-docker run -e DB_HOST=tickets-db -e DB_PASSWORD=secret ... tickets-backend:multistage
-docker run --env-file backend.env ... tickets-backend:multistage   # KEY=value lines, e.g. DB_PASSWORD=secret
-
-# docker compose: the `environment:` section of compose.yaml, with values from ../.env
+# in a container: docker run -e NAME=value ...   or   docker run --env-file <file> ...
 ```
 
 ### 4. JVM options
 
-[Dockerfile.multistage](Dockerfile.multistage) sets a default with `ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"`. The JVM reads this variable automatically, so the heap scales with the container memory limit (`docker run -m 512m ...`). Override it at start-up to add options:
+The JVM automatically reads the `JAVA_TOOL_OPTIONS` environment variable. In containers it is a convenient way to pass JVM flags without changing the start command, e.g. `-XX:MaxRAMPercentage=75.0`, which sizes the heap from the container's memory limit.
 
-```bash
-docker run -e JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=50 -Duser.timezone=Europe/Athens" ...
-```
+> Spring does **not** read `.env` files. For `mvn spring-boot:run`, use the defaults or export the variables in your shell.
 
-> Spring does **not** read a `.env` file. That file is only for Docker Compose. For `mvn spring-boot:run`, use the defaults or export the variables in your shell.
-
-## Run locally (without building an image)
+## Run locally
 
 Requirements: JDK 25 and Maven 3.9+ (both are already in the dev container), plus a running PostgreSQL:
 
@@ -140,45 +132,56 @@ mvn test
 | [TicketControllerTest](src/test/java/gr/hua/dit/tickets/web/TicketControllerTest.java)   | `@SpringBootTest` + MockMvc, incl. security |
 | [TicketsApplicationTests](src/test/java/gr/hua/dit/tickets/TicketsApplicationTests.java) | context loads                         |
 
-## Docker
+## Containerizing the backend
 
-### Step 1: naive [Dockerfile](Dockerfile)
+There is no Dockerfile yet. You write it in [steps 2–4 of the main README](../README.md#4-containerizing-the-app-step-by-step). The reference solution is on the `docker` branch.
+
+### Facts you need for the Dockerfile
+
+| What | Value |
+|---|---|
+| Java version | **25** (build with a JDK 25, run with a JRE 25) |
+| Build tool | Maven 3.9 |
+| Build command | `mvn -B package` (add `-DskipTests` to skip tests; they don't need a DB either way) |
+| Download dependencies only | `mvn -B dependency:go-offline` (needs only `pom.xml`) |
+| Build output | **`target/app.jar`** (fixed name via `<finalName>` in [pom.xml](pom.xml)), a self-contained "fat" jar |
+| Start command | `java -jar app.jar` |
+| Port | **8080** |
+| Health endpoint | `GET /actuator/health` (public, returns `{"status":"UP"}`) |
+| Required at runtime | a reachable PostgreSQL, configured with the `DB_*` variables ([Configuration](#configuration)) |
+| Writes files? | no; the app needs no writable directory (good for a non-root user) |
+| Shutdown | graceful on `SIGTERM` (`server.shutdown=graceful`) |
+
+### Step by step
+
+1. **Run the tests locally** (`mvn test`) so you know the code is fine before you blame Docker.
+2. **Naive Dockerfile** (`Dockerfile`): one stage with Maven + JDK, copy everything, package, run the jar. Build and run it, then note the image size and user (`id`).
+3. **`.dockerignore`**: exclude at least `target/`, `.idea/`, `.vscode/`, `*.iml`, `.git/`.
+4. **Multi-stage Dockerfile** (`Dockerfile.multistage`):
+   1. build stage: copy `pom.xml` → download dependencies → copy `src/` → package
+   2. runtime stage: JRE-only base image → create a non-root user → copy **only** `app.jar` from the build stage → `USER` → `EXPOSE 8080` → `HEALTHCHECK` → start command
+5. **Run it with a database** on a user-defined network, passing `DB_HOST` etc. with `-e`.
+
+### What to take care of
+
+- **`localhost` is not your database** inside a container. `DB_HOST` must be the DB container's name (or the Compose service name).
+- The **credentials must match** the ones the Postgres container was created with.
+- **Order for caching:** `pom.xml` and the dependency download first, `src/` afterwards. Otherwise every code change re-downloads all of Maven Central.
+- **JRE, not JDK**, in the runtime image. No Maven, no sources, no `~/.m2` in the final image.
+- **Non-root:** create a system user/group (on Alpine: `addgroup`/`adduser`; on Debian/Ubuntu: `groupadd`/`useradd`) and switch with `USER`. Check with `docker exec <container> id`.
+- **Exec form** for the start command, so `docker stop` triggers the graceful shutdown instead of a kill after 10 s.
+- **Healthcheck tool:** JRE images have no `curl`. Alpine has BusyBox `wget`. Give the app time to start (`--start-period`).
+- **Memory:** by default the JVM sizes its heap from the machine's memory, not the container's limit. Use `JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"`.
+- **No secrets in the image:** the DB password is passed at `docker run` / Compose time, never with `ENV` in the Dockerfile.
+
+### How to check
 
 ```bash
 docker build -t tickets-backend:naive .
-docker run --rm tickets-backend:naive id      # uid=0(root) 😬
-```
-
-Problems with this image: it is about 1 GB because it ships Maven, the JDK, the sources and the `.m2` cache; it runs as **root**; and any code change re-downloads all dependencies.
-
-### Step 2: [Dockerfile.multistage](Dockerfile.multistage)
-
-```bash
 docker build -f Dockerfile.multistage -t tickets-backend:multistage .
+docker images | grep tickets-backend          # compare sizes
+docker run --rm tickets-backend:multistage id # must not be root
+docker ps                                     # (healthy) once the DB is reachable
+curl http://localhost:8080/actuator/health
+curl -u alice:password http://localhost:8080/api/tickets
 ```
-
-- **Build stage** (`maven:3.9-eclipse-temurin-25`): copies `pom.xml` first and runs `dependency:go-offline`, so that layer stays cached. Then it copies `src/` and runs `mvn package`.
-- **Runtime stage** (`eclipse-temurin:25-jre-alpine`): only the JRE and `app.jar`.
-- Creates the user `spring` and switches to it with `USER`, so the app does **not** run as root.
-- Sets a `HEALTHCHECK` on `/actuator/health`, and `-XX:MaxRAMPercentage` so the JVM respects the container memory limit.
-
-### Run it
-
-The backend needs PostgreSQL on the same Docker network:
-
-```bash
-docker network create tickets-net
-docker run -d --name tickets-db --network tickets-net \
-  -e POSTGRES_DB=tickets -e POSTGRES_USER=tickets -e POSTGRES_PASSWORD=tickets \
-  postgres:18-alpine
-
-docker run -d --name tickets-backend --network tickets-net \
-  -e DB_HOST=tickets-db -p 8080:8080 \
-  tickets-backend:multistage
-
-docker ps                      # STATUS shows (healthy) after ~20s
-docker logs -f tickets-backend
-docker exec tickets-backend id # uid=100(spring)
-```
-
-Or start the full stack from the repository root with `docker compose up --build` (see the [main README](../README.md)).

@@ -1,5 +1,6 @@
 // Tiny wrapper around fetch() for the Spring Boot API (HTTP Basic auth).
-// All URLs are relative (/api/...): Vite (dev) or nginx (Docker) forwards them to the backend.
+// All URLs are relative (/api/...): the server that delivers the page (the Vite dev server in
+// development, a web server / reverse proxy in production) forwards them to the backend.
 
 const KEY = 'tickets-auth'
 let auth = sessionStorage.getItem(KEY)

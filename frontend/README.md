@@ -17,13 +17,12 @@ src/
 │   ├── LoginForm.vue
 │   └── TicketBoard.vue        list + form, buttons depend on the role
 └── __tests__/                 Vitest tests
-nginx/default.conf.template    nginx config used by the Docker image
 ```
 
 All API calls use **relative** URLs (`/api/...`). The frontend never needs the backend's address itself:
 
 - in development, the **Vite dev server** proxies `/api` to the backend ([vite.config.js](vite.config.js))
-- in Docker, **nginx** proxies `/api` to the backend ([nginx/default.conf.template](nginx/default.conf.template))
+- in production, the **web server** that serves the built files must do the same (that is part of the Docker exercises)
 
 Because the browser only talks to one origin, no CORS configuration is needed.
 
@@ -57,22 +56,13 @@ The frontend has a single setting: **`BACKEND_URL`**, the address of the Spring 
 
 The Vue app is just static JS running in the user's browser, and a browser cannot read environment variables. So [api.js](src/api.js) only uses **relative** URLs (`/api/tickets`), and the server that delivers the page forwards `/api` to the backend:
 
-| Mode | Who reads `BACKEND_URL` | When | Default |
-|---|---|---|---|
-| `npm run dev` | [vite.config.js](vite.config.js) via `process.env.BACKEND_URL` → dev-server proxy | dev server start | `http://localhost:8080` |
-| Docker, naive image | same Vite dev server inside the container | container start | `http://localhost:8080` |
-| Docker, multistage image | nginx: [default.conf.template](nginx/default.conf.template) contains `proxy_pass ${BACKEND_URL};` | container start | `ENV BACKEND_URL=http://tickets-backend:8080` in the Dockerfile |
-
-How nginx gets the value: the nginx image runs `envsubst` on every `/etc/nginx/templates/*.template` file at start-up and writes the result to `/etc/nginx/conf.d/`. Only variables that are actually set are replaced, so nginx's own `$uri`, `$host`, ... are left alone. Check the result:
+In development, [vite.config.js](vite.config.js) reads `process.env.BACKEND_URL` when the dev server starts, and proxies `/api` to it. The default is `http://localhost:8080`:
 
 ```bash
-docker compose exec frontend cat /etc/nginx/conf.d/default.conf | grep proxy_pass
+BACKEND_URL=http://some-host:8080 npm run dev
 ```
 
-```bash
-# override at start-up, no rebuild needed
-docker run -e BACKEND_URL=http://my-backend:8080 -p 8081:8080 tickets-frontend:multistage
-```
+After `npm run build` there is no Vite server any more, only static files in `dist/`. Whatever serves them (e.g. nginx in a container) has to proxy `/api` to the backend, with the backend address set when the container **starts**.
 
 ### Why not `VITE_API_URL`?
 
@@ -94,39 +84,50 @@ npm run test:watch   # re-run on file changes
 | [api.test.js](src/__tests__/api.test.js)                         | Basic auth header, JSON body, error handling (mocked `fetch`) |
 | [TicketBoard.test.js](src/__tests__/TicketBoard.test.js)         | USER sees the form and edit buttons; AGENT can assign; creating a ticket |
 
-## Docker
+## Containerizing the frontend
 
-### Step 1: naive [Dockerfile](Dockerfile)
+There is no Dockerfile yet. You write it in [steps 5–6 of the main README](../README.md#4-containerizing-the-app-step-by-step). The reference solution is on the `docker` branch.
+
+### Facts you need for the Dockerfile
+
+| What | Value |
+|---|---|
+| Node version | **24** (22+ works) |
+| Install dependencies | `npm ci` (exact versions from `package-lock.json`, needs `package.json` + `package-lock.json` only) |
+| Dev server | `npm run dev` → port **5173**, already listens on all interfaces (`host: true` in [vite.config.js](vite.config.js)) |
+| Dev server backend address | env var `BACKEND_URL` (default `http://localhost:8080`) |
+| Production build | `npm run build` → static files in **`dist/`** (`index.html` + `assets/`) |
+| What the production server must do | serve `dist/`; proxy **`/api/`** to the backend; return `index.html` for unknown paths |
+| Tests | `npm test` (no backend needed) |
+
+### Step by step
+
+1. **Run it locally** (`npm install`, `npm test`, `npm run dev`) against a running backend.
+2. **`.dockerignore`**: exclude at least `node_modules/`, `dist/`, `.git/`, IDE folders.
+3. **Naive Dockerfile** (`Dockerfile`): Node image, copy everything, install, start the dev server. Run it on the backend's network with `BACKEND_URL=http://<backend container name>:8080`.
+4. **Multi-stage Dockerfile** (`Dockerfile.multistage`):
+   1. build stage: Node → copy `package.json` + `package-lock.json` → `npm ci` → copy sources → `npm run build`
+   2. runtime stage: a non-root web server (e.g. `nginxinc/nginx-unprivileged:alpine`) → your server config → copy **only** `dist/` from the build stage → `HEALTHCHECK`
+5. **Web server config** (e.g. `nginx/default.conf.template`): static files, `/api/` proxy to `${BACKEND_URL}`, SPA fallback to `index.html`.
+
+### What to take care of
+
+- **Never copy your local `node_modules`** into the image. It can contain binaries for your OS/CPU. Install inside the image.
+- **`npm ci`, not `npm install`**, in Dockerfiles: reproducible builds, and it fails if the lock file is out of date.
+- **Layer order:** package files + `npm ci` first, sources afterwards, so a code change does not reinstall everything.
+- **The browser cannot read environment variables.** Keep the API calls relative (`/api/...`) and let the web server proxy them. Do **not** put the backend URL in a `VITE_*` variable: it would be fixed at build time inside the JS bundle.
+- **Configure the backend URL at container start:** the official nginx images render `/etc/nginx/templates/*.template` with `envsubst` at start-up (see the *Using environment variables in nginx configuration* section of the image docs).
+- **Non-root ⇒ port ≥ 1024.** The unprivileged nginx listens on **8080**, not 80. Publish with e.g. `-p 8081:8080`.
+- **SPA fallback:** without it, reloading the page on a client-side route returns 404.
+- **Healthcheck address:** use `127.0.0.1` (or make nginx listen on IPv6 too), because `localhost` may resolve to `::1`.
+
+### How to check
 
 ```bash
 docker build -t tickets-frontend:naive .
-docker run --rm -p 5173:5173 -e BACKEND_URL=http://<backend-host>:8080 tickets-frontend:naive
-```
-
-This image runs the **Vite dev server** as **root**. It contains Node, all of `node_modules` and the sources, which makes it about **1.8 GB**.
-
-### Step 2: [Dockerfile.multistage](Dockerfile.multistage)
-
-```bash
 docker build -f Dockerfile.multistage -t tickets-frontend:multistage .
+docker images | grep tickets-frontend            # compare sizes
+docker run --rm tickets-frontend:multistage id   # must not be root
+docker exec <frontend container> cat /etc/nginx/conf.d/default.conf   # is BACKEND_URL filled in?
+curl -u alice:password http://localhost:8081/api/tickets             # proxied to the backend
 ```
-
-- **Build stage** (`node:24-alpine`): copies `package*.json` first and runs `npm ci` (a cached layer), then runs `npm run build`.
-- **Runtime stage** (`nginxinc/nginx-unprivileged:alpine`): only nginx and `dist/`, about **90 MB**.
-- Runs as the non-root user `nginx` (uid 101). It therefore listens on port **8080**, because a non-root user cannot bind to ports below 1024.
-- At start-up the nginx image renders `/etc/nginx/templates/*.template` with `envsubst`, which is how the `BACKEND_URL` variable ends up in the nginx config.
-
-### Run it
-
-The frontend container must be on the same network as the backend container:
-
-```bash
-docker run -d --name tickets-frontend --network tickets-net \
-  -e BACKEND_URL=http://tickets-backend:8080 \
-  -p 8081:8080 \
-  tickets-frontend:multistage
-```
-
-Open <http://localhost:8081>.
-
-Or start the full stack from the repository root with `docker compose up --build` (see the [main README](../README.md)).
