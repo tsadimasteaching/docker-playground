@@ -2,6 +2,11 @@
 # Runs once after the dev container is created.
 set -euo pipefail
 
+# Debug tools: netcat (port checks, e.g. `nc -zv localhost 5432`) and psql client.
+sudo apt-get update -y
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  netcat-openbsd postgresql-client
+
 # Handy Docker aliases.
 cat >> ~/.bashrc <<'ALIASES'
 
