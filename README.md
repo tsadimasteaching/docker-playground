@@ -25,6 +25,7 @@ The app is a small **ticketing system**:
 | [`frontend/`](frontend)           | Vue 3 + Vite single-page app with Vitest tests. See [frontend/README.md](frontend/README.md) |
 | [`compose.yaml`](compose.yaml)    | Starts the whole stack (db + backend + frontend) with one command        |
 | [`compose.secrets.yaml`](compose.secrets.yaml) | Same stack, but the DB password is passed as a Compose **secret** (section 5) |
+| [`compose.distroless.yaml`](compose.distroless.yaml) | Override file: builds the backend from `Dockerfile.distroless` (section 7) |
 | [`.env.example`](.env.example)    | Template for `.env` (DB credentials, ports) used by Compose              |
 
 Each component has **two Dockerfiles** so you can compare them:
@@ -33,6 +34,7 @@ Each component has **two Dockerfiles** so you can compare them:
 |-------------------------|----------------------------------------------------------------------------------------|
 | `Dockerfile`            | The *naive* version: one stage, runs as **root**, ships build tools and source code    |
 | `Dockerfile.multistage` | The *better* version: **multi-stage** build, **non-root** user, layer caching, healthcheck |
+| `Dockerfile.distroless` | Backend only: like multistage, but the runtime image is **distroless** (no shell, no package manager). See section 7 |
 
 ---
 
@@ -630,7 +632,116 @@ If you need a PAT in another CI system, store it as a **secret** of that system,
 
 ---
 
-## 7. Running without Docker (for development)
+## 7. Going further: distroless images
+
+The multi-stage images are already small and run as non-root, but they still contain an operating system: Alpine with a shell (`sh`), `busybox` (`wget`, `ls`, `vi`, ...) and the `apk` package manager. The app needs none of these. Each one is extra code that can have vulnerabilities, and if an attacker gets into the container, it gives them tools to work with.
+
+A **distroless** image contains only the application and what it needs at run time: for Java, the JRE, glibc, CA certificates and time zone data. No shell, no package manager, no coreutils. The best-known ones are Google's [distroless images](https://github.com/GoogleContainerTools/distroless).
+
+```mermaid
+flowchart LR
+    subgraph N["Dockerfile (naive)"]
+        direction TB
+        N1["app.jar"] --- N2["Maven + full JDK"] --- N3["source code, ~/.m2"] --- N4["Ubuntu: shell, apt, tools"]
+    end
+    subgraph M["Dockerfile.multistage"]
+        direction TB
+        M1["app.jar"] --- M2["JRE"] --- M3["Alpine: sh, busybox, apk"]
+    end
+    subgraph D["Dockerfile.distroless"]
+        direction TB
+        D1["app.jar"] --- D2["JRE"] --- D3["glibc, CA certs, tzdata"]
+    end
+    N -- "multi-stage build" --> M -- "drop the OS tools" --> D
+```
+
+### 7.1 The distroless backend
+
+[`backend/Dockerfile.distroless`](backend/Dockerfile.distroless) uses the same build stage as `Dockerfile.multistage`. Only the runtime stage changes:
+
+```dockerfile
+FROM gcr.io/distroless/java25-debian13:nonroot   # ":nonroot" -> runs as uid 65532
+WORKDIR /app
+COPY --from=build /build/target/app.jar app.jar
+...
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+```
+
+Without a shell, some things you are used to stop working:
+
+| In `Dockerfile.multistage` | Problem without a shell | In `Dockerfile.distroless` |
+|---|---|---|
+| `RUN addgroup ... && adduser ...` | `RUN` needs `/bin/sh` | Use the user built into the image: tag `:nonroot`, `USER nonroot` |
+| `HEALTHCHECK CMD wget ... \|\| exit 1` | no `wget`, and `\|\|` is shell syntax | A tiny Java class, [`HealthCheck.java`](backend/healthcheck/HealthCheck.java), compiled in the build stage and run with the JVM already in the image |
+| `ENTRYPOINT java -jar app.jar` (shell form) | the shell form runs `/bin/sh -c ...` | Exec (JSON) form only: `["java", "-jar", ...]` |
+| `docker exec -it backend sh` | there is no `sh` | See 7.3 |
+
+Build and compare:
+
+```bash
+cd backend
+docker build -f Dockerfile.multistage -t tickets-backend:multistage .
+docker build -f Dockerfile.distroless -t tickets-backend:distroless .
+docker images | grep tickets-backend
+
+docker run --rm --entrypoint ls tickets-backend:multistage /bin | wc -l   # 83 programs
+docker run --rm --entrypoint sh tickets-backend:distroless                # error: "sh": executable file not found
+```
+
+| Image | Size (compressed) | Runs as | Shell / package manager |
+|---|---|---|---|
+| `tickets-backend:multistage` | ~138 MB | `spring` (uid 100) | `sh`, busybox, `apk` |
+| `tickets-backend:distroless` | ~133 MB | `nonroot` (uid 65532) | none |
+
+The size is about the same: the JRE is most of both images. The gain is the **attack surface**: fewer packages, so fewer CVEs to patch and nothing for an attacker to use. Compare with a scanner such as [Trivy](https://trivy.dev/) or Docker Scout:
+
+```bash
+docker scout quickview tickets-backend:multistage
+docker scout quickview tickets-backend:distroless
+# or: trivy image tickets-backend:distroless
+```
+
+### 7.2 Use it with Compose
+
+[`compose.distroless.yaml`](compose.distroless.yaml) is an **override file**: it changes only the backend's Dockerfile, everything else comes from the first file. Compose merges the files from left to right:
+
+```bash
+docker compose -f compose.yaml -f compose.distroless.yaml up -d --build
+
+# combined with the secrets example from section 5
+docker compose -f compose.secrets.yaml -f compose.distroless.yaml up -d --build
+
+docker compose -f compose.yaml -f compose.distroless.yaml config   # see the merged result
+docker compose -f compose.yaml -f compose.distroless.yaml ps       # backend: (healthy)
+```
+
+Secrets work unchanged: Spring reads `/run/secrets/DB_PASSWORD` with Java code, not with a shell.
+
+### 7.3 Debugging a container without a shell
+
+`docker exec -it <container> sh` is not possible. Instead:
+
+- **Logs first:** `docker compose logs backend`. Most problems are visible there.
+- **Debug image variant:** distroless has a `:debug-nonroot` tag with a busybox shell. Switch to it temporarily, never in production:
+  ```bash
+  docker run --rm -it --entrypoint sh gcr.io/distroless/java25-debian13:debug-nonroot
+  ```
+- **A sidecar debug container** that shares the network and the processes of the running container:
+  ```bash
+  docker run --rm -it --pid=container:tickets-backend-1 --network=container:tickets-backend-1 busybox:1.37 sh
+  # inside:
+  ps                                              # you see "java -jar /app/app.jar" as PID 1
+  wget -qO- http://localhost:8080/actuator/health # localhost = the backend container
+  ```
+  Kubernetes has the same idea built in: `kubectl debug` with an *ephemeral container*.
+
+### 7.4 What about the frontend?
+
+The frontend keeps `nginx-unprivileged:alpine`. Its start-up script uses a **shell** and `envsubst` to put `BACKEND_URL` into the nginx configuration (see section 5), and a distroless image cannot run that script. To go distroless there, you would write the backend address into the nginx configuration at build time (which breaks "build once, configure at start-up"), or use a minimal nginx image such as [Chainguard's](https://images.chainguard.dev/directory/image/nginx/overview) and pass the configuration another way. Distroless works best for apps that read their own configuration, such as Java or Go programs.
+
+---
+
+## 8. Running without Docker (for development)
 
 You still need PostgreSQL, so start just the DB container:
 
@@ -665,5 +776,7 @@ cd frontend && npm test
 - [nginx-unprivileged image](https://hub.docker.com/r/nginxinc/nginx-unprivileged)
 - [Spring Boot container images](https://docs.spring.io/spring-boot/reference/packaging/container-images/index.html)
 - [Dev Containers](https://containers.dev/)
+- [Distroless container images](https://github.com/GoogleContainerTools/distroless)
+- [Compose: merging multiple files](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/)
 - [Working with the Container registry (ghcr.io)](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
 - [Managing personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-secure/managing-your-personal-access-tokens)

@@ -1,0 +1,12 @@
+# Override file: build the backend from Dockerfile.distroless instead of
+# Dockerfile.multistage. Everything else comes from the first -f file.
+#
+#   docker compose -f compose.yaml -f compose.distroless.yaml up --build
+#   docker compose -f compose.secrets.yaml -f compose.distroless.yaml up --build   (with secrets)
+#
+# See README section "Distroless images".
+
+services:
+  backend:
+    build:
+      dockerfile: Dockerfile.distroless

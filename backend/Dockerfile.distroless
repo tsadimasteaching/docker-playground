@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# Dockerfile.distroless — step 3: the runtime image has only the JRE and the jar
+#
+#   * same build stage as Dockerfile.multistage
+#   * runtime: Google "distroless" Java image: no shell, no package manager,
+#     no busybox / wget / curl, only the Java runtime and its libraries
+#   * runs as the built-in "nonroot" user (uid 65532)
+#   * HEALTHCHECK uses a tiny Java class, because there is no wget
+#
+# Build:  docker build -f Dockerfile.distroless -t tickets-backend:distroless .
+# Run:    docker run --rm --network tickets-net -e DB_HOST=tickets-db -p 8080:8080 tickets-backend:distroless
+# ---------------------------------------------------------------------------
+
+# ===== Stage 1: build =======================================================
+FROM maven:3.9-eclipse-temurin-25 AS build
+
+WORKDIR /build
+
+COPY pom.xml .
+RUN mvn -B dependency:go-offline
+
+COPY src ./src
+RUN mvn -B package -DskipTests
+
+# The health check helper: compiled here, because the runtime has no compiler.
+COPY healthcheck/HealthCheck.java ./healthcheck/
+RUN javac -d ./healthcheck ./healthcheck/HealthCheck.java
+
+# ===== Stage 2: runtime =====================================================
+# ":nonroot" = the image's default user is nonroot (uid 65532), not root.
+FROM gcr.io/distroless/java25-debian13:nonroot
+
+WORKDIR /app
+
+COPY --from=build /build/target/app.jar app.jar
+COPY --from=build /build/healthcheck/HealthCheck.class healthcheck/
+
+# Already the default in the :nonroot tag, made explicit for teaching purposes.
+USER nonroot:nonroot
+
+EXPOSE 8080
+
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"
+
+# No shell -> only the exec (JSON) form works: CMD-SHELL, "|| exit 1",
+# pipes and $VARIABLES are all shell features.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["java", "-cp", "/app/healthcheck", "HealthCheck"]
+
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
