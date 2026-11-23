@@ -24,6 +24,7 @@ The app is a small **ticketing system**:
 | [`backend/`](backend)             | Spring Boot API: entities, repositories, services, Spring Security, Swagger, tests. See [backend/README.md](backend/README.md) |
 | [`frontend/`](frontend)           | Vue 3 + Vite single-page app with Vitest tests. See [frontend/README.md](frontend/README.md) |
 | [`compose.yaml`](compose.yaml)    | Starts the whole stack (db + backend + frontend) with one command        |
+| [`compose.secrets.yaml`](compose.secrets.yaml) | Same stack, but the DB password is passed as a Compose **secret** (section 5) |
 | [`.env.example`](.env.example)    | Template for `.env` (DB credentials, ports) used by Compose              |
 
 Each component has **two Dockerfiles** so you can compare them:
@@ -371,9 +372,265 @@ The password is defined **once** in `.env` and used by two services: `db` (`POST
 
 Environment variables are fine for a playground, but anyone with Docker access can read them with `docker inspect`. They can also end up in logs. For real secrets use [Compose secrets](https://docs.docker.com/compose/how-tos/use-secrets/), which are mounted as files under `/run/secrets/`, or Kubernetes Secrets / a secret manager. **Never** put secrets in a Dockerfile (`ENV` or `ARG`): they become part of the image and are visible with `docker history`.
 
+#### Example: the database password as a Compose secret
+
+[`compose.secrets.yaml`](compose.secrets.yaml) is the same stack as `compose.yaml`, but the password reaches `db` and `backend` as a **file**, not as an environment variable.
+
+**Environment variable vs. secret:**
+
+```mermaid
+flowchart LR
+    subgraph ENV["compose.yaml: environment variable"]
+        direction TB
+        E1[".env<br/>POSTGRES_PASSWORD=change-me"] --> E2["container environment<br/>DB_PASSWORD=change-me"]
+        E2 -.-> E3["visible in docker inspect,<br/>/proc/&lt;pid&gt;/environ,<br/>child processes, logs"]
+    end
+    subgraph SEC["compose.secrets.yaml: secret"]
+        direction TB
+        S1["secrets/db_password.txt"] --> S2["read-only file in the container<br/>/run/secrets/DB_PASSWORD"]
+        S2 -.-> S3["not in the environment,<br/>the app reads the file at start-up"]
+    end
+```
+
+**How it works:**
+
+```mermaid
+flowchart LR
+    F["secrets/db_password.txt<br/>(your machine, in .gitignore)"]
+
+    subgraph C["compose.secrets.yaml"]
+        T["① top-level secrets:<br/>db_password:<br/>  file: ./secrets/db_password.txt"]
+    end
+
+    subgraph DB["db container (postgres)"]
+        D1["/run/secrets/db_password<br/>(read-only)"]
+        D2["③ POSTGRES_PASSWORD_FILE<br/>entrypoint reads the file and<br/>sets the database password"]
+        D1 --> D2
+    end
+
+    subgraph BE["backend container (Spring Boot)"]
+        B1["/run/secrets/DB_PASSWORD<br/>(read-only)"]
+        B2["③ SPRING_CONFIG_IMPORT=<br/>optional:configtree:/run/secrets/<br/>file DB_PASSWORD → ${DB_PASSWORD}"]
+        B1 --> B2
+    end
+
+    subgraph FE["frontend container"]
+        X["no secrets: key<br/>→ sees nothing"]
+    end
+
+    F --> T
+    T -- "② db: secrets: - db_password" --> D1
+    T -- "② backend: secrets:<br/>source: db_password<br/>target: DB_PASSWORD" --> B1
+    B2 == "JDBC login with the same password" ==> D2
+```
+
+① where the secret comes from, ② which service gets it and under which file name, ③ how the application reads it.
+
+Both containers end up with the **same password**: Postgres uses it to create the user, and the backend uses it to log in over JDBC.
+
+1. The top-level `secrets:` key says **where** a secret comes from:
+   ```yaml
+   secrets:
+     db_password:
+       file: ./secrets/db_password.txt
+   ```
+2. Each service lists the secrets **it** needs. Compose mounts each one read-only under `/run/secrets/`:
+   ```yaml
+   db:
+     secrets:
+       - db_password                 # short syntax -> /run/secrets/db_password
+   backend:
+     secrets:
+       - source: db_password         # long syntax: choose the file name
+         target: DB_PASSWORD         # -> /run/secrets/DB_PASSWORD
+   ```
+3. The application must read the **file**:
+   - **PostgreSQL:** the official image supports `*_FILE` variables, so `POSTGRES_PASSWORD_FILE: /run/secrets/db_password` replaces `POSTGRES_PASSWORD`. Set only one of the two: the image refuses to start if both are set.
+   - **Spring Boot:** `SPRING_CONFIG_IMPORT: optional:configtree:/run/secrets/` turns every file in that folder into a property **named after the file**. The file `DB_PASSWORD` fills `${DB_PASSWORD}` in [application.properties](backend/src/main/resources/application.properties), so the Java code does not change at all.
+
+**Steps:**
+
+```bash
+# 1. create the secret file (printf: no trailing newline)
+mkdir -p secrets
+printf '%s' 'a-long-random-password' > secrets/db_password.txt
+# or generate one: openssl rand -base64 24 | tr -d '\n' > secrets/db_password.txt
+
+# 2. start the stack with the secrets file
+#    (if you already ran compose.yaml, the existing volume keeps the OLD password, see the note above:
+#     run "docker compose down -v" first)
+docker compose -f compose.secrets.yaml up -d --build
+
+# 3. check: the password is a file inside the container ...
+docker compose -f compose.secrets.yaml exec backend ls -l /run/secrets/
+docker compose -f compose.secrets.yaml exec backend cat /run/secrets/DB_PASSWORD
+
+# ... and NOT in the container's environment
+docker inspect tickets-backend-1 --format '{{json .Config.Env}}'
+
+# 4. the app still works
+curl -u alice:password http://localhost:8080/api/tickets
+
+# 5. stop
+docker compose -f compose.secrets.yaml down
+```
+
+Good to know:
+
+- `secrets/` is in `.gitignore`. Never commit the secret file.
+- With plain Compose (not Swarm), a secret is a **bind mount** of the file, so it keeps the file's owner and permissions from your machine. The backend runs as a non-root user, so the file must be readable by it (the default `644` is fine, `chmod 600` breaks the backend).
+- A secret can also come from a variable of the shell that runs Compose, instead of a file: `db_password: { environment: DB_PASSWORD_FROM_SHELL }`.
+- Anyone who can run `docker exec` can still read `/run/secrets/...`. Secrets are hidden from `docker inspect`, `docker history`, the process environment and child processes. They are not hidden from someone who controls Docker.
+
 ---
 
-## 6. Running without Docker (for development)
+## 6. Publishing images to GitHub Container Registry (ghcr.io)
+
+So far the images exist only on your machine. To run them somewhere else (a server, a classmate's laptop, Kubernetes) you **push** them to a registry. GitHub has one built in: **GitHub Container Registry**, at `ghcr.io`.
+
+An image name in a registry has the form:
+
+```
+ghcr.io/<owner>/<image>:<tag>
+        │        │       └─ version, e.g. 1.0, latest, a git SHA
+        │        └─ any name, e.g. tickets-backend
+        └─ your GitHub username or organization, in lowercase
+```
+
+### 6.1 Create a Personal Access Token (PAT)
+
+`docker login` does not accept your GitHub password. You need a token:
+
+1. GitHub → your avatar → **Settings → Developer settings → Personal access tokens → Tokens (classic)**
+   (direct link: <https://github.com/settings/tokens/new?scopes=write:packages>).
+2. **Generate new token (classic)**, give it a name (e.g. `ghcr docker-playground`) and an expiration date.
+3. Select the scopes:
+   - `write:packages` (push images; it also selects `read:packages`)
+   - `delete:packages` only if you want to delete images from the command line
+4. **Generate token** and copy it now. GitHub shows it only once.
+
+> Use a **classic** token. Fine-grained tokens do not support the Container Registry yet.
+
+Treat the token like a password: do not commit it, do not paste it in a Dockerfile or in `compose.yaml`.
+
+### 6.2 Log in
+
+Pass the token on **stdin**, so it does not end up in your shell history or in `ps`:
+
+```bash
+export GHCR_USER=your-github-username       # lowercase
+export GHCR_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx  # the token from 6.1 (or: read -s GHCR_TOKEN)
+
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+# Login Succeeded
+```
+
+Docker stores the credentials in `~/.docker/config.json` (or in the OS keychain with Docker Desktop). `docker logout ghcr.io` removes them.
+
+### 6.3 Tag and push
+
+An image can have several names (tags). Add a registry name to the images you built in section 3, then push:
+
+```bash
+docker tag tickets-backend:multistage  ghcr.io/$GHCR_USER/tickets-backend:1.0
+docker tag tickets-frontend:multistage ghcr.io/$GHCR_USER/tickets-frontend:1.0
+
+docker push ghcr.io/$GHCR_USER/tickets-backend:1.0
+docker push ghcr.io/$GHCR_USER/tickets-frontend:1.0
+```
+
+Or build with the final name directly:
+
+```bash
+docker build -f backend/Dockerfile.multistage -t ghcr.io/$GHCR_USER/tickets-backend:1.0 backend
+```
+
+Push a `latest` tag too, if you want `docker pull` without a tag to work:
+
+```bash
+docker tag ghcr.io/$GHCR_USER/tickets-backend:1.0 ghcr.io/$GHCR_USER/tickets-backend:latest
+docker push ghcr.io/$GHCR_USER/tickets-backend:latest
+```
+
+Layers that already exist in the registry are not uploaded again (`Layer already exists`), so the second push is much faster.
+
+> **Apple silicon (M1/M2/...)**: your images are `linux/arm64` and will not run on a typical `amd64` server. Build for both platforms and push in one step:
+> ```bash
+> docker buildx build --platform linux/amd64,linux/arm64 \
+>   -f backend/Dockerfile.multistage -t ghcr.io/$GHCR_USER/tickets-backend:1.0 --push backend
+> ```
+
+### 6.4 Visibility and linking to the repository
+
+- New packages are **private**. You see them under your profile → **Packages**. To let anyone pull without logging in: open the package → **Package settings → Change visibility → Public**.
+- To show the package on the repository page, connect it: **Package settings → Manage Actions access / Connect repository**, or add this label to the Dockerfile before building:
+  ```dockerfile
+  LABEL org.opencontainers.image.source=https://github.com/<owner>/docker-playground
+  ```
+
+### 6.5 Pull and run from the registry
+
+On any machine (log in first if the package is private):
+
+```bash
+docker pull ghcr.io/$GHCR_USER/tickets-backend:1.0
+docker run -d --name tickets-backend --network tickets-net -e DB_HOST=tickets-db \
+  -p 8080:8080 ghcr.io/$GHCR_USER/tickets-backend:1.0
+```
+
+In Compose, use `image:` instead of `build:`, and Compose pulls the images instead of building them:
+
+```yaml
+services:
+  backend:
+    image: ghcr.io/<owner>/tickets-backend:1.0
+  frontend:
+    image: ghcr.io/<owner>/tickets-frontend:1.0
+```
+
+> **Private images:** `compose.yaml` has no place for a token. Compose uses the credentials saved by `docker login`, so on every machine that pulls private images, log in first (as in 6.2) and then run `docker compose pull` / `docker compose up`. For a machine that only pulls, a token with just `read:packages` is enough. Never put the token in `compose.yaml` or `.env`.
+
+If a service has **both** `build:` and `image:`, `docker compose build` tags the built image with that name and `docker compose push` pushes it.
+
+### 6.6 Pushing from GitHub Actions (no PAT needed)
+
+In a workflow, use the automatic `GITHUB_TOKEN` instead of a personal token. The job needs `packages: write` permission:
+
+```yaml
+permissions:
+  contents: read
+  packages: write
+
+steps:
+  - uses: actions/checkout@v4
+  - uses: docker/login-action@v3
+    with:
+      registry: ghcr.io
+      username: ${{ github.actor }}
+      password: ${{ secrets.GITHUB_TOKEN }}
+  - uses: docker/build-push-action@v6
+    with:
+      context: backend
+      file: backend/Dockerfile.multistage
+      push: true
+      tags: ghcr.io/${{ github.repository_owner }}/tickets-backend:${{ github.sha }}
+```
+
+If you need a PAT in another CI system, store it as a **secret** of that system, never in the repository.
+
+### Common errors
+
+| Error | Cause |
+|---|---|
+| `denied: denied` / `unauthorized` on login | Wrong username, or you used your password instead of the token, or the token expired |
+| `denied: permission_denied: The token provided does not match expected scopes` | Token without `write:packages` |
+| `invalid reference format: repository name must be lowercase` | Owner or image name contains capitals: use lowercase |
+| `manifest unknown` on pull | The tag does not exist (check the spelling, or push it first) |
+| `exec format error` when the container starts | Image built for another CPU architecture (see the buildx note in 6.3) |
+
+---
+
+## 7. Running without Docker (for development)
 
 You still need PostgreSQL, so start just the DB container:
 
@@ -408,3 +665,5 @@ cd frontend && npm test
 - [nginx-unprivileged image](https://hub.docker.com/r/nginxinc/nginx-unprivileged)
 - [Spring Boot container images](https://docs.spring.io/spring-boot/reference/packaging/container-images/index.html)
 - [Dev Containers](https://containers.dev/)
+- [Working with the Container registry (ghcr.io)](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+- [Managing personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-secure/managing-your-personal-access-tokens)

@@ -14,3 +14,6 @@ dist/
 
 # Local environment (secrets)
 .env
+
+# Compose secrets (compose.secrets.yaml)
+secrets/
