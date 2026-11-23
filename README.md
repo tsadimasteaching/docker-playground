@@ -737,7 +737,13 @@ Secrets work unchanged: Spring reads `/run/secrets/DB_PASSWORD` with Java code, 
 
 ### 7.4 What about the frontend?
 
-The frontend keeps `nginx-unprivileged:alpine`. Its start-up script uses a **shell** and `envsubst` to put `BACKEND_URL` into the nginx configuration (see section 5), and a distroless image cannot run that script. To go distroless there, you would write the backend address into the nginx configuration at build time (which breaks "build once, configure at start-up"), or use a minimal nginx image such as [Chainguard's](https://images.chainguard.dev/directory/image/nginx/overview) and pass the configuration another way. Distroless works best for apps that read their own configuration, such as Java or Go programs.
+The frontend does **not need** a distroless image:
+
+- **Little to gain:** the image is only nginx + static files on Alpine. Distroless would mostly remove `sh` and busybox; nginx itself, which is most of the attack surface, stays.
+- **Nothing sensitive inside:** no database access, no secrets. It serves files and forwards `/api` to the backend. The backend is the container worth hardening.
+- **Already hardened:** multi-stage build, non-root user (uid 101), no Node, `node_modules` or source code.
+
+There is also a practical reason. The frontend keeps `nginx-unprivileged:alpine` because its start-up script uses a **shell** and `envsubst` to put `BACKEND_URL` into the nginx configuration (see section 5), and a distroless image cannot run that script. To go distroless there, you would write the backend address into the nginx configuration at build time (which breaks "build once, configure at start-up"), or use a minimal nginx image such as [Chainguard's](https://images.chainguard.dev/directory/image/nginx/overview) and pass the configuration another way. Distroless works best for apps that read their own configuration, such as Java or Go programs.
 
 ---
 
